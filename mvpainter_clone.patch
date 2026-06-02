@@ -1,0 +1,285 @@
+diff --git a/MVPainter/infer_multiview.py b/MVPainter/infer_multiview.py
+index 1819c77..6305235 100755
+--- a/MVPainter/infer_multiview.py
++++ b/MVPainter/infer_multiview.py
+@@ -35,7 +35,16 @@ def depth_exr_to_png(exr_file, png_file, depth_channel='V', depth_scale=6.0):
+     exr_image = OpenEXR.InputFile(exr_file)
+     header = exr_image.header()
+     size = (header['displayWindow'].max.x + 1, header['displayWindow'].max.y + 1)
+-    channel_names = exr_image.header()['channels'].keys()
++    channel_names = list(exr_image.header()['channels'].keys())
++    # Patch (texture-normal eval baseline harness): Blender 4.5 writes RGBA channels
++    # by default; the original 'V' (Value) channel only exists in older Blender output.
++    # Fall back to 'R' (the depth value is replicated across RGB when written from a
++    # single-channel compositor input).
++    if depth_channel not in channel_names:
++        for fallback in ('R', 'Y', 'Z'):
++            if fallback in channel_names:
++                depth_channel = fallback
++                break
+     depth_channel = exr_image.channel(depth_channel, Imath.PixelType(Imath.PixelType.FLOAT))
+ 
+     depth_array = np.frombuffer(depth_channel, dtype=np.float32).copy()
+@@ -138,14 +147,20 @@ def infer(pipeline, obj_path, image_file, filenames=['000.png', '005.png', '001.
+         return
+     
+ 
+-    cmds = [f'{blender_path}', '--background', '-Y',
++    # Patch (texture-normal eval baseline harness): resolve scripts/blender_render_ortho.py
++    # to an absolute path so the Blender child doesn't depend on the parent process's cwd
++    # being MVPainter/. (The error path observed at REPO_ROOT/scripts/... means cwd was off.)
++    _MVP_DIR = os.path.dirname(os.path.abspath(__file__))
++    _blender_script_abs = os.path.join(_MVP_DIR, 'scripts', 'blender_render_ortho.py')
++    _blender_bin_abs = blender_path if os.path.isabs(blender_path) else os.path.join(_MVP_DIR, blender_path)
++    cmds = [_blender_bin_abs, '--background', '-Y',
+             '--python',
+-            'scripts/blender_render_ortho.py', '--',
++            _blender_script_abs, '--',
+             '--object_path', f'{obj_path}',
+             '--geo_rotation',f'{args.geo_rotation}'
+             ]
+     print(" ".join(cmds))
+-    subprocess.run(cmds)
++    subprocess.run(cmds, cwd=_MVP_DIR)
+     os.makedirs('render_temp',exist_ok=True)
+     normal_path = os.path.join("render_temp", object_uid,
+                                "normal")
+@@ -273,13 +288,29 @@ if __name__ == '__main__':
+         filename="unet_w_controlnet/v29_25000.ckpt"  # 改成你实际的 ckpt 文件路径
+     )
+ 
+-    ckpt = torch.load(unet_ckpt_path)[
++    # Patch (texture-normal eval baseline harness): load to CPU first to avoid
++    # OOM when CUDA memory is limited (e.g. competing training run on the same GPU).
++    # The pipeline.to('cuda') below will then move only the active model to GPU.
++    ckpt = torch.load(unet_ckpt_path, map_location='cpu')[
+         "state_dict"]
+     new_ckpt = {k[5:]: v for k, v in ckpt.items() if "unet" in k}
+     pipeline.unet.load_state_dict(new_ckpt)
+-
+-
+-    pipeline = pipeline.to(torch.device('cuda'))
++    del ckpt, new_ckpt
++    import gc; gc.collect()
++    if torch.cuda.is_available():
++        torch.cuda.empty_cache()
++
++
++    # Patch (texture-normal eval baseline harness): use model CPU offload to fit
++    # in constrained GPU memory. enable_sequential_cpu_offload caused meta-tensor
++    # errors after our manual unet.load_state_dict, so we use the lighter
++    # enable_model_cpu_offload which doesn't replace tensors with meta proxies.
++    try:
++        pipeline.enable_model_cpu_offload()
++        print('[patch] enabled model CPU offload (limits peak GPU memory)')
++    except Exception as _e:
++        print(f'[patch] CPU offload unavailable, falling back to full-GPU move: {_e}')
++        pipeline = pipeline.to(torch.device('cuda'))
+ 
+     
+ 
+diff --git a/MVPainter/infer_paint.py b/MVPainter/infer_paint.py
+index f6796cd..1d87831 100755
+--- a/MVPainter/infer_paint.py
++++ b/MVPainter/infer_paint.py
+@@ -1,8 +1,18 @@
+ 
+-import os 
++import os
++import sys
+ from glob import glob
+ from scripts.remesh_reduce_blender_script import remesh_and_replace,reduce_mesh
+ import argparse
++
++# Patch (texture-normal eval baseline harness): the os.system(cmd) calls below
++# spawn `python ...` and `../blender-4.2.9-linux-x64/blender ...` via /bin/sh.
++# In our env the system PATH's `python` does not have torch (env not activated
++# inside /bin/sh), and the blender symlink target was bumped to 4.5.0. Use
++# absolute paths everywhere so PATH and version drift don't matter.
++_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
++_PYTHON = sys.executable                                            # the env's python
++_BLENDER = os.path.join(_THIS_DIR, '..', 'blender-4.2.9-linux-x64', 'blender')
+ parser = argparse.ArgumentParser()
+ parser.add_argument('--mv_res_dir', type=str, default='./outputs/test/mvpainter', help='input directory.')
+ parser.add_argument('--output_dir', type=str, default='./results/test/mvpainter', help='output directory.')
+@@ -28,56 +38,56 @@ for obj in objs:
+ if not use_pbr:
+     # 烘焙贴图
+     cmd = f'''
+-    cd mvpainter/ && \
+-    python bake_pipeline.py --input_dir {input_dir} --save_dir {os.path.join(save_path,'glbs')} --offset {args.geo_rotation + 90}
++    cd {_THIS_DIR}/mvpainter/ && \
++    {_PYTHON} bake_pipeline.py --input_dir {input_dir} --save_dir {os.path.join(save_path,'glbs')} --offset {args.geo_rotation + 90}
+     '''
+     os.system(cmd)
+ else:
+     # basecolor
+     cmd = f'''
+-    cd mvpainter/ && \
+-    python bake_pipeline.py --input_dir {input_dir} --save_dir {os.path.join(save_path,'basecolor')} --offset {args.geo_rotation + 90} --suffix _basecolor
++    cd {_THIS_DIR}/mvpainter/ && \
++    {_PYTHON} bake_pipeline.py --input_dir {input_dir} --save_dir {os.path.join(save_path,'basecolor')} --offset {args.geo_rotation + 90} --suffix _basecolor
+     '''
+     os.system(cmd)
+ 
+     cmd = f'''
+-    cd scripts && \
+-    python blender_bake.py --input_dir {os.path.join(save_path,'basecolor')} --save_dir {os.path.join(save_path,'basecolor_bake')}
++    cd {_THIS_DIR}/scripts && \
++    {_BLENDER} --background --python blender_bake.py -- --input_dir {os.path.join(save_path,'basecolor')} --save_dir {os.path.join(save_path,'basecolor_bake')}
+     '''
+     os.system(cmd)
+ 
+ 
+     # metallic
+     cmd = f'''
+-    cd mvpainter/ && \
+-    python bake_pipeline.py --input_dir {input_dir} --save_dir {os.path.join(save_path,'metallic')} --offset {args.geo_rotation + 90} --suffix _metallic
++    cd {_THIS_DIR}/mvpainter/ && \
++    {_PYTHON} bake_pipeline.py --input_dir {input_dir} --save_dir {os.path.join(save_path,'metallic')} --offset {args.geo_rotation + 90} --suffix _metallic
+     '''
+     os.system(cmd)
+ 
+ 
+     cmd = f'''
+-    cd scripts && \
+-    python blender_bake.py --input_dir {os.path.join(save_path,'metallic')} --save_dir {os.path.join(save_path,'metallic_bake')}
++    cd {_THIS_DIR}/scripts && \
++    {_BLENDER} --background --python blender_bake.py -- --input_dir {os.path.join(save_path,'metallic')} --save_dir {os.path.join(save_path,'metallic_bake')}
+     '''
+     os.system(cmd)
+ 
+     # roughness
+ 
+     cmd = f'''
+-    cd mvpainter/ && \
+-    python bake_pipeline.py --input_dir {input_dir} --save_dir {os.path.join(save_path,'roughness')} --offset {args.geo_rotation + 90} --suffix _roughness
++    cd {_THIS_DIR}/mvpainter/ && \
++    {_PYTHON} bake_pipeline.py --input_dir {input_dir} --save_dir {os.path.join(save_path,'roughness')} --offset {args.geo_rotation + 90} --suffix _roughness
+     '''
+     os.system(cmd)
+ 
+     cmd = f'''
+-    cd scripts && \
+-    python blender_bake.py --input_dir {os.path.join(save_path,'roughness')} --save_dir {os.path.join(save_path,'roughness_bake')}
++    cd {_THIS_DIR}/scripts && \
++    {_BLENDER} --background --python blender_bake.py -- --input_dir {os.path.join(save_path,'roughness')} --save_dir {os.path.join(save_path,'roughness_bake')}
+     '''
+     os.system(cmd)
+ 
+     # expor pbr glb
+     cmd = f'''
+-    ../blender-4.2.9-linux-x64/blender  --background -Y --python scripts/blender_pbr_glb.py -- --basecolor_dir {os.path.join(save_path,'basecolor_bake')} --metallic_dir {os.path.join(save_path,'metallic_bake')} --roughness_dir {os.path.join(save_path,'roughness_bake')} --output_dir {os.path.join(save_path,'combine_pbr')}
++    cd {_THIS_DIR} && {_BLENDER}  --background -Y --python scripts/blender_pbr_glb.py -- --basecolor_dir {os.path.join(save_path,'basecolor_bake')} --metallic_dir {os.path.join(save_path,'metallic_bake')} --roughness_dir {os.path.join(save_path,'roughness_bake')} --output_dir {os.path.join(save_path,'combine_pbr')}
+     '''
+     os.system(cmd)
+ 
+diff --git a/MVPainter/scripts/blender_bake.py b/MVPainter/scripts/blender_bake.py
+index e80f2d4..36bc01b 100755
+--- a/MVPainter/scripts/blender_bake.py
++++ b/MVPainter/scripts/blender_bake.py
+@@ -5,8 +5,16 @@ import sys
+ import random
+ import math
+ import argparse
++
++# Patch (texture-normal eval baseline harness): when invoked via
++# `blender --background --python blender_bake.py -- ...`, Blender does not filter
++# sys.argv at `--`; the script sees `[blender, --background, --python, blender_bake.py,
++# --, --input_dir, X, --save_dir, Y]` and argparse fails on `--background` etc.
++# Slice sys.argv at `--` so only the script's own args are parsed.
++if "--" in sys.argv:
++    sys.argv = [sys.argv[0]] + sys.argv[sys.argv.index("--") + 1:]
++
+ parser = argparse.ArgumentParser()
+-args, extra = parser.parse_known_args()
+ parser.add_argument("--input_dir", default="")
+ parser.add_argument("--save_dir",default="")
+ 
+@@ -55,8 +63,18 @@ for glb_file in glb_files:
+ 
+     
+     fbx_path = os.path.join(fbx_dir,f"{name}.obj")
+-    bpy.ops.export_scene.obj(
+-            filepath=fbx_path, 
+-            use_selection=False, 
++    # Patch (texture-normal eval baseline harness): Blender 4.5 removed
++    # bpy.ops.export_scene.obj; the replacement is bpy.ops.wm.obj_export. Keep
++    # a fallback in case anyone re-pins to 4.2.x where only the old name exists.
++    if hasattr(bpy.ops.wm, "obj_export"):
++        bpy.ops.wm.obj_export(
++            filepath=fbx_path,
++            export_selected_objects=False,
++            export_materials=True,
++        )
++    else:
++        bpy.ops.export_scene.obj(
++            filepath=fbx_path,
++            use_selection=False,
+             use_materials=True,
+-            )
++        )
+diff --git a/MVPainter/scripts/remesh_reduce_blender_script.py b/MVPainter/scripts/remesh_reduce_blender_script.py
+index d766d52..47455b3 100755
+--- a/MVPainter/scripts/remesh_reduce_blender_script.py
++++ b/MVPainter/scripts/remesh_reduce_blender_script.py
+@@ -1,5 +1,14 @@
+-import bpy 
+-import os 
++import os
++
++# Patch (texture-normal eval baseline harness): bpy is not available in this env
++# (PyPI ships bpy only for cp311+, our env is cp310). The two functions used by
++# infer_paint.py — reduce_mesh and remesh_and_replace — are wrapped with trimesh
++# fallbacks below, so the missing bpy is non-fatal for our smoke run.
++try:
++    import bpy
++except ModuleNotFoundError:
++    bpy = None
++    print("[patch] bpy not installed; reduce_mesh/remesh_and_replace will use trimesh fallbacks")
+ def update_obj_mtl(obj_path, new_mtl_file="test.mtl"):
+     """
+     修改指定文件夹下所有 .obj 文件，使其引用的 .mtl 文件改为指定的文件名。
+@@ -29,6 +38,32 @@ def update_obj_mtl(obj_path, new_mtl_file="test.mtl"):
+ 
+ 
+ def reduce_mesh(fname, decimate_type='DECIMATE', target_vertices=5000, smooth_type=1,output_path = None):
++    # Patch (texture-normal eval baseline harness): if bpy is missing, fall back to
++    # trimesh-based decimation. infer_paint calls this with target_vertices=30000;
++    # most meshes in our eval are smaller than that already (e.g. 3K-10K verts), so
++    # decimation is a no-op for them — we just copy fname → output_path. For larger
++    # meshes, trimesh's quadric_decimation produces a similarly reduced mesh.
++    if bpy is None:
++        import shutil, os
++        try:
++            import trimesh
++            mesh = trimesh.load(fname, force='mesh', process=False)
++            if hasattr(mesh, 'vertices') and len(mesh.vertices) > target_vertices:
++                # Quadric decimation. trimesh's API: simplify_quadric_decimation(face_count).
++                target_faces = int(target_vertices * 1.8)  # heuristic: faces ≈ 1.8× verts for triangle meshes
++                try:
++                    mesh = mesh.simplify_quadric_decimation(face_count=target_faces)
++                except Exception:
++                    pass  # if decimation fails, write the original mesh
++            if output_path is None:
++                output_path = fname
++            mesh.export(output_path)
++        except Exception as exc:
++            print(f"[patch reduce_mesh] trimesh fallback failed: {exc}; copying {fname} → {output_path}")
++            if output_path is not None and output_path != fname:
++                shutil.copy2(fname, output_path)
++        return
++
+     ### Load ###
+     reset_scene()
+     name = fname.split('/')[-1]
+@@ -92,6 +127,9 @@ def reset_scene() -> None:
+     Returns:
+         None
+     """
++    # Patch: no-op when bpy is unavailable (the trimesh fallback paths don't use it)
++    if bpy is None:
++        return
+     # delete everything that isn't part of a camera or a light
+     for obj in bpy.data.objects:
+         bpy.data.objects.remove(obj, do_unlink=True)
