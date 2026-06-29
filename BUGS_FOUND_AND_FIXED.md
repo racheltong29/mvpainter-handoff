@@ -1,5 +1,3 @@
-# Bugs found and fixed — reduce_mesh / decimation pipeline
-
 Session date: 2026-06-23. Files touched: `MVPainter/scripts/remesh_reduce_blender_script.py`,
 `MVPainter/infer_paint.py`, `MVPainter/scripts/run_reduce_mesh.py` (new),
 `MVPainter/run_full_pipeline.sh` (new), and the `mvpainter` conda env's
@@ -14,29 +12,7 @@ as `UPSTREAM_PATCHES.md`.
 
 ---
 
-## 1. Dead `assert()` always fires, decimation never runs
-
-File: `MVPainter/scripts/remesh_reduce_blender_script.py`, `reduce_mesh()`
-
-**Symptom:** calling `reduce_mesh()` always raised `AssertionError`, regardless
-of whether `bpy` was available.
-
-**Root cause:** the function had a bare `assert()` statement. In Python,
-`assert()` parses as `assert (empty tuple)`, and an empty tuple is always
-falsy — so this line **always** raised, unconditionally, on every call. This
-was almost certainly meant to be a precondition check (assert that `bpy` is
-loaded) but was never written correctly, so the real decimation code below it
-never executed even once before this investigation.
-
-**Fix:**
-```python
-assert bpy is not None, "bpy not available - reduce_mesh must be run via the Blender binary"
-```
-A real precondition check that only fires when `bpy` is genuinely missing.
-
----
-
-## 2. `bpy` cannot be imported in the pipeline's actual Python env
+## 1. `bpy` cannot be imported in Python env
 
 File: `MVPainter/infer_paint.py` (caller of `reduce_mesh`)
 
