@@ -19,10 +19,9 @@ File: `MVPainter/infer_paint.py` (caller of `reduce_mesh`)
 **Symptom:** `ModuleNotFoundError: No module named 'bpy'` when `infer_paint.py`
 calls `reduce_mesh()` directly in-process.
 
-**Root cause:** `infer_paint.py` runs under the `mvpainter` conda env (Python
+**Cause:** `infer_paint.py` runs under the `mvpainter` conda env (Python
 3.10). PyPI's `bpy` package has never shipped a `cp310` wheel for **any**
-version — confirmed against PyPI's full release JSON, and via
-`pip install bpy==3.6.0 --dry-run` → `Could not find a version that satisfies
+version. This was confirmed against PyPI's full release JSON and when I ran `pip install bpy==3.6.0 --dry-run`, it reported that it `Could not find a version that satisfies
 the requirement bpy==3.6.0 (from versions: none)`. Every `bpy` release is
 `cp311`-only (4.2.0–5.0.1) or `cp313`-only (5.1.0+).
 
@@ -31,11 +30,7 @@ the requirement bpy==3.6.0 (from versions: none)`. Every `bpy` release is
 > `HANDOFF.md` is real and necessary, but not because of `bpy` — see the
 > Python 3.11 compatibility test below.
 
-A trimesh-based fallback existed for this (decimate via
-`trimesh.simplify_quadric_decimation` when `bpy` is `None`) but had been
-commented out with nothing replacing it, so when `bpy` was missing the
-function had no working path at all.
-
+A trimesh-based fallback existed for this as part of the previous UPSTREAM_PATCHES but itself had errors with decimation that reduced it to broken output Blender files.
 **Fix:** `reduce_mesh` is no longer called in-process. `infer_paint.py` now
 invokes it via subprocess, running the real Blender binary:
 ```bash
@@ -46,8 +41,9 @@ blender --background --python scripts/run_reduce_mesh.py -- \
 calls `reduce_mesh()`.) This mirrors the pattern already used elsewhere in
 the codebase for `blender_bake.py` and `blender_pbr_glb.py`.
 
-We also tried a separate Python 3.11 conda env (`bpy311`) with `pip install
-bpy` as an alternative to launching the full Blender app — this also works
+I also tried a separate Python 3.11 conda env (`bpy311`) with `pip install
+bpy` as an alternative to launching the full Blender app 
+This also works
 (confirmed `bpy` 5.0.1 imports and runs `reduce_mesh` correctly), but we ended
 up using the Blender-binary approach instead since it requires no extra env
 and matches the existing codebase convention. The `bpy311` env is left in
@@ -57,7 +53,7 @@ place in case it's useful for quick scripting.
 
 ## 3. Blender 4.0+ removed the OBJ import/export operators we were using
 
-File: `MVPainter/scripts/remesh_reduce_blender_script.py` — both
+File: `MVPainter/scripts/remesh_reduce_blender_script.py` both
 `reduce_mesh()` and `remesh_and_replace()`
 
 **Symptom** (first time `reduce_mesh()` actually ran against real Blender 4.5,
