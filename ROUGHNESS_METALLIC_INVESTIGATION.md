@@ -22,7 +22,7 @@ directly (see §11 and Open Questions).
 
 ---
 
-## 1. Initial symptom: dragon/dino asset (`12321371e98d41b4afe98796a529cf17`) looks flat
+## 1. Initial symptom: dragon/dino asset (`12321371e98d41b4afe98796a529cf17`) looks matte
 
 Rendered via the Blender toolkit (`blender_glb.py`, `studio_bg_static.blend`) with
 no changes to lighting produced a visibly duller result than your reference image
@@ -201,9 +201,7 @@ see §8.
 
 ## 8. Bug #3 (or missing knob): `eta=1.0` — DDIM sampling injects maximum noise
 
-**Observation you raised:** "my advisor's roughness/metallic packed [texture] is
-a lot less noisy and weird — it has clean-cut forms." The CFG sweep above
-recovered *structure* but at the cost of visible grain — a different axis than
+The CFG sweep above recovered *structure* but at the cost of visible grain — a different axis than
 variance.
 
 **Cause:** `eta=1.0` is hardcoded in `infer_pbr.py`'s pipeline call. In DDIM
@@ -303,7 +301,7 @@ one of our attempts — see the table in §7).
 
 ## 10. UV orientation check — ruled out, not a fixable mismatch
 
-You noticed the roughness/metallic maps "feel flipped" relative to the reference.
+The roughness/metallic maps relative to the reference look oriented in the wrong direction.
 Tested all 8 rigid transforms (flips + 90°/180°/270° rotations + transpose/
 transverse) correlating our textures against your `mv_` reference's, for both
 assets.
