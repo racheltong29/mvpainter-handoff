@@ -14,8 +14,11 @@ plus open questions at the end.
 sampling in `infer_pbr.py`). Found that `guidance_scale=1.0` (CFG disabled,
 hardcoded, no CLI override) suppresses real model capability for metallic/roughness
 prediction — raising it plus setting `eta=0.0` recovers substantial material
-differentiation. Could not fully close the gap to your reference files, and found
-a real contradiction worth resolving with you directly (see §8 and Open Questions).
+differentiation. Separately investigated your reference's noticeably **simpler
+basecolor** (§9) — ruled out a texture-merge-algorithm explanation, found the
+same `guidance_scale`/`eta` combination partially explains it too, but couldn't
+fully close that gap either. Found a real contradiction worth resolving with you
+directly (see §11 and Open Questions).
 
 ---
 
@@ -37,6 +40,12 @@ No lighting change can produce shine on a surface baked that rough. Clamping
 roughness to ≤0.35 purely for the render (not touching the source glb) reproduced
 the expected shiny look, confirming the render pipeline was never the problem —
 the discrepancy is in the asset's own PBR bake.
+
+![dino comparison grid](roughness_investigation_images/dino_comparison_grid.png)
+*basecolor (top row) and roughness/metallic (bottom row) across `runs_export`,
+your `mv_` reference, our unmodified rerun, and our `guidance_scale=7.5` test —
+notice the roughness/metallic row is a near-flat wash in every column for this
+asset, including your reference; only the flat *value* differs.*
 
 ---
 
@@ -87,6 +96,12 @@ Quantified with std-dev of the metallic (Blue) channel:
 | `runs_export` | 0.013 |
 | your `mv_` reference | **0.473** |
 | our fresh rerun (unmodified code) | 0.029 |
+
+![barrel comparison grid](roughness_investigation_images/barrel_comparison_grid.png)
+*same layout, barrel/knife asset. Here your reference (2nd column) clearly shows
+real metal-vs-wood separation in the bottom row that `runs_export`, our
+unmodified rerun, and even our `guidance_scale=7.5` test (last column, noisier)
+don't cleanly reproduce.*
 
 ---
 
@@ -218,9 +233,75 @@ This is a real, substantial improvement over the `eta=1.0` sweep, but **still
 doesn't fully reach your reference's combination of very low noise + very high
 structure**. See Open Questions.
 
+![eta noise comparison](roughness_investigation_images/eta_noise_comparison.png)
+*same asset, same `guidance_scale=5.0`, only `eta` changed. Left: `eta=1.0`
+(current hardcoded default) — visible speckle/grain throughout. Right: `eta=0.0`
+— smooth gradients, clean bands, much closer to your reference's character.*
+
 ---
 
-## 9. UV orientation check — ruled out, not a fixable mismatch
+## 9. Basecolor investigation: why does your reference's basecolor look simpler?
+
+You separately flagged that your reference's **basecolor** looks noticeably
+simpler/cleaner than ours, even though basecolor was never the channel we set
+out to fix — worth its own section since it turned out to be informative in a
+different way than the metallic/roughness investigation.
+
+**First, direct evidence for *why* metallic/roughness comes out weak in the first
+place, which is also relevant context for basecolor:** compared the raw,
+single-view painted images (`result_1_basecolor.png` vs. `result_1_roughness.png`
+for the identical camera view), generated straight out of the multiview diffusion
+model, *before* any baking/merging/projection touches them:
+
+![raw signal strength barrel](roughness_investigation_images/raw_signal_strength_barrel.png)
+![raw signal strength dino](roughness_investigation_images/raw_signal_strength_dino.png)
+
+Basecolor has real, rich per-pixel detail in both cases; roughness is already a
+near-featureless flat wash (or, for the dino, a flat gray silhouette) *at the
+earliest artifact we can inspect* — confirming the flatness originates in the
+generation step itself, not in later processing. Basecolor is clearly the
+strongly-grounded channel here; metallic/roughness is comparatively starved for
+signal.
+
+**Checked whether a different texture-merge algorithm explains the "simpler"
+look — ruled out.** `bake_pipeline.py`'s `BakeConfig.merge_method` references a
+`'graphcut'` option (`bake_from_multiview(..., method='graphcut')` as the default
+parameter), which would normally mean smarter seam-finding between multi-view
+projections (potentially cleaner merged textures than simple weighted blending).
+Checked the actual installed `differentiable_renderer/mesh_render.py`: **only
+`fast_bake_texture` exists** — there is no graphcut implementation in this
+codebase at all, so `merge_method='fast'` (the only thing ever actually used) is
+not a lever we could switch to try to reproduce a cleaner look.
+
+**What we found instead:** the same `guidance_scale`/`eta` combination that fixed
+metallic/roughness also affects basecolor, since all three channels are produced
+in one shared batched diffusion call. Raising `guidance_scale` alone (`eta=1.0`)
+visibly *degrades* basecolor (noisier, more fragmented — see the sweep table in
+§7). Adding `eta=0.0` claws most of that back (basecolor Laplacian noise dropped
+~29% at the same `guidance_scale=5.0`, see §8), but our best combination still
+isn't as clean as your reference's basecolor (Laplacian 7.2, cleaner than every
+one of our attempts — see the table in §7).
+
+**Untested hypotheses worth trying next, specifically for basecolor:**
+- **`num_inference_steps`** (pipeline default 50, no CLI override currently in
+  `infer_pbr.py`) — more steps generally means a more converged, less noisy
+  result across all channels; could plausibly explain simpler/cleaner basecolor
+  without needing to touch `guidance_scale` at all.
+- **Stage 0 settings** (`infer_multiview.py --diffusion_steps`, currently 75) —
+  basecolor's ceiling on detail/complexity is set by how detailed the multiview
+  RGB paint already is *before* PBR decomposition ever runs. If your reference's
+  basecolor is simpler at a more fundamental level, it might trace back to
+  different Stage 0 settings entirely, not anything in `infer_pbr.py`.
+- **Mesh decimation target** (`--target_vertices 30000` in `run_reduce_mesh.py`)
+  — a coarser mesh means less high-frequency geometric detail gets projected
+  into the UV texture, which could also read as "simpler."
+
+**Also checked: is it a UV-orientation issue (basecolor "looks flipped")?** See
+§10 below — checked for both assets, ruled out as a fixable mismatch.
+
+---
+
+## 10. UV orientation check — ruled out, not a fixable mismatch
 
 You noticed the roughness/metallic maps "feel flipped" relative to the reference.
 Tested all 8 rigid transforms (flips + 90°/180°/270° rotations + transpose/
@@ -249,7 +330,7 @@ likely coincidental, not evidence of a shared deterministic unwrap.
 
 ---
 
-## 10. Open contradiction: "she ran the same repo clone" vs. the evidence
+## 11. Open contradiction: "she ran the same repo clone" vs. the evidence
 
 You said the reference `mv_*.glb` files came from the same repo clone. This is
 in tension with what we found:
