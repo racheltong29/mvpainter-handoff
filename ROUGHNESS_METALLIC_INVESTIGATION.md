@@ -345,7 +345,54 @@ in tension with what we found:
 
 So logically, if the code really was byte-identical, the CFG-driven structure in
 your reference shouldn't be possible. Something doesn't add up — worth resolving
-directly rather than guessing further. See Open Questions below.
+directly rather than guessing further.
+
+To make sure this wasn't just an argument from a diff, we went further and
+actually ran the literal pre-patch codebase (below), not just our patched
+script with stock-equivalent flags.
+
+## 12. Ran the actual unmodified, pre-patch `infer_pbr.py` end-to-end
+
+Everything above (§6-9) was tested using our *patched* `infer_pbr.py` with
+`--guidance_scale`/`--eta`/`--seed` set back to their original defaults
+(1.0/1.0/unseeded-equivalent). That's behaviorally the same as stock, but it's
+still technically our file. To close that gap, we did the literal thing:
+
+- `git stash push -- infer_pbr.py` to put the working tree back to the exact
+  pre-patch commit (`cdfba0a`), confirmed byte-identical via `diff` against
+  `git show HEAD:MVPainter/infer_pbr.py`.
+- Ran that file directly — no CLI flags exist on it (they're our addition), so
+  this is `guidance_scale=1.0`, `eta=1.0`, and **fully unseeded** sampling, on
+  the same multiview input already generated for the barrel asset
+  (`1218d2ecdd18465a8c778ec2981caab1`).
+- Restored our patched file afterward (`git stash pop`).
+
+The first comparison we ran was misleading: we initially compared the stock
+run's raw `combine_basecolor.png` (the per-camera multiview diffusion output,
+pre-bake) directly against your `advisor_mv_basecolor.png` (a baked UV-atlas
+texture) — different representations entirely, not a fair comparison
+(`stock_codebase_vs_advisor.png`).
+
+The correct comparison is UV-atlas vs. UV-atlas. Since baking the literal
+stock run through the full mesh/UV pipeline wasn't done separately, we used
+our existing `fresh_rerun_basecolor.png` as the proxy — it was generated with
+the same effective settings (cfg=1.0, eta=1.0) already baked into UV space,
+which is behaviorally equivalent to what the stock script would produce
+(`stock_uvspace_vs_advisor.png`):
+
+![Stock UV-space basecolor vs advisor](roughness_investigation_images/stock_uvspace_vs_advisor.png)
+
+**Finding**: same UV layout and composition as your reference — same two ring
+shapes, same gray-panel-left / wood-grain-right split, so this isn't a
+wrong-asset or flipped-UV problem. But the gap we already found in §9 holds
+even at true stock settings: your basecolor has visibly crisper wood-grain
+detail and sharper edges, ours is smoother and lower-contrast.
+
+**Conclusion**: running the actual unmodified codebase does not reproduce your
+results either. The gap exists even before any of our patches are applied.
+This doesn't resolve the "same repo clone" contradiction from §11 — if
+anything it sharpens it, since it rules out "you just ran our patched script
+with different defaults" as an explanation. See Open Questions below.
 
 ---
 
