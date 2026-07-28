@@ -394,6 +394,57 @@ with different defaults" as an explanation. See Open Questions below.
 
 ---
 
+## 13. Ran the full pipeline at the commit right after your original handoff changes, before any of ours
+
+Separately from §12 (which tested the pre-patch *script in isolation*), we
+tried to run the **full three-stage pipeline** (`infer_multiview.py` →
+`infer_pbr.py` → `infer_paint.py`) at `fddbd9b` — the commit right after your
+original MVPainter handoff changes were implemented, before either the
+parallel-bake work or any of the eval-harness patches in this doc. Checked
+out in an isolated git worktree so it wouldn't disturb the main branch, on
+the dino asset (`12321371e98d41b4afe98796a529cf17`).
+
+**Stage 1 (multiview render) crashed immediately** on a Blender-version
+mismatch: this container's Blender 4.5 writes depth EXRs with RGBA channels,
+but the pre-patch code looks for a `'V'` channel that only exists in older
+Blender output. Verified this is a true no-op fix, not one hiding a real
+difference — for the actual rendered EXR, the R/G/B channels are
+pixel-for-pixel identical (`max |R-G| = 0.0`), so falling back to `'R'`
+recovers the exact same depth values.
+
+**Stage 2 (`infer_pbr.py`, run completely unmodified — no CLI flags exist on
+it at this commit, so it's `guidance_scale=1.0`, `eta=1.0`, and fully
+unseeded)** completed once Stage 1 could run:
+
+![fddbd9b baseline dino diffusion output](roughness_investigation_images/fddbd9b_baseline_dino_grid.png)
+*raw multiview diffusion output (pre-bake) for the dino asset, at the literal
+unmodified commit right after your handoff changes. Same near-flat,
+undifferentiated character as everything else we found at these settings —
+see §7-9.*
+
+**Stage 3 (mesh decimation → UV bake → final glb) could not complete** in
+this container at the literal `fddbd9b` state. It hits, in sequence: `bpy`
+unavailable to `scripts/blender_bake.py` (same root cause as `infer_paint.py`
+importing `bpy` directly, documented in `UPSTREAM_PATCHES.md` §4, plus this
+script being shelled out to via bare `python` rather than the Blender binary,
+§5/§6), then a `cupy`/CUDA kernel mismatch in
+`differentiable_renderer/voronoi.py` (`CUDA_ERROR_INVALID_IMAGE`, §9 in
+`UPSTREAM_PATCHES.md`). Getting Stage 3 to run means reconstructing nearly
+the entire eval-harness patch commit (`1596668`) piece by piece — at which
+point it stops being a meaningful "before" data point, since the
+reconstructed environment is functionally the patched one.
+
+**Conclusion:** this container can't produce a final textured GLB from the
+literal `fddbd9b` commit — that would need an environment matching upstream's
+original pinned deps (Blender 4.2.4, a working `bpy`, a compatible `cupy`
+build) rather than this one. But the diffusion-stage output we *can* get at
+this exact pre-any-of-our-changes commit shows the same flat/undifferentiated
+roughness-metallic behavior already documented in §7-9 — the material
+differentiation gap isn't something introduced by later patches; it's present
+at the very first commit after your original handoff work.
+
+---
+
 ## Open Questions for your advisor
 
 1. **How exactly were the `mv_*.glb` reference files generated?** Specifically
