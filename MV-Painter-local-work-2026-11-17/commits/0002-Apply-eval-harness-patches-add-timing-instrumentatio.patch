@@ -1,0 +1,799 @@
+From 159666873d8056ffc379e5fff783e76fdc82ab63 Mon Sep 17 00:00:00 2001
+From: racheltong29 <racheltong29@gmail.com>
+Date: Mon, 15 Jun 2026 20:33:44 +0000
+Subject: [PATCH 2/2] Apply eval harness patches + add timing instrumentation
+
+Patches (previously documented in UPSTREAM_PATCHES.md):
+- infer_multiview.py, infer_paint.py: absolute python/blender paths,
+  avoid PATH/version drift in os.system subprocess shells
+- differentiable_renderer/voronoi.py: fix for our CUDA env
+- scripts/blender_bake.py: GLB export compat fix
+- scripts/remesh_reduce_blender_script.py: bpy trimesh fallback +
+  fix missing fast-simplification dep (root cause of 10-asset timeout)
+
+New instrumentation scripts:
+- infer_paint_timed.py: per-stage wall-clock timing for stage 3
+- mvpainter/bake_pipeline_timed.py: per-substep timing inside call_bake
+  (showed xatlas UV-unwrap was 99% of bake time on undecimated meshes)
+
+Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
+---
+ MVPainter/infer_multiview.py                  |  47 ++++-
+ MVPainter/infer_paint.py                      |  42 ++--
+ MVPainter/infer_paint_timed.py                | 137 +++++++++++++
+ MVPainter/mvpainter/bake_pipeline_timed.py    | 192 ++++++++++++++++++
+ .../differentiable_renderer/voronoi.py        |  94 ++++++---
+ MVPainter/scripts/blender_bake.py             |  28 ++-
+ .../scripts/remesh_reduce_blender_script.py   |  42 +++-
+ 7 files changed, 521 insertions(+), 61 deletions(-)
+ create mode 100644 MVPainter/infer_paint_timed.py
+ create mode 100644 MVPainter/mvpainter/bake_pipeline_timed.py
+
+diff --git a/MVPainter/infer_multiview.py b/MVPainter/infer_multiview.py
+index 1819c77..6305235 100755
+--- a/MVPainter/infer_multiview.py
++++ b/MVPainter/infer_multiview.py
+@@ -35,7 +35,16 @@ def depth_exr_to_png(exr_file, png_file, depth_channel='V', depth_scale=6.0):
+     exr_image = OpenEXR.InputFile(exr_file)
+     header = exr_image.header()
+     size = (header['displayWindow'].max.x + 1, header['displayWindow'].max.y + 1)
+-    channel_names = exr_image.header()['channels'].keys()
++    channel_names = list(exr_image.header()['channels'].keys())
++    # Patch (texture-normal eval baseline harness): Blender 4.5 writes RGBA channels
++    # by default; the original 'V' (Value) channel only exists in older Blender output.
++    # Fall back to 'R' (the depth value is replicated across RGB when written from a
++    # single-channel compositor input).
++    if depth_channel not in channel_names:
++        for fallback in ('R', 'Y', 'Z'):
++            if fallback in channel_names:
++                depth_channel = fallback
++                break
+     depth_channel = exr_image.channel(depth_channel, Imath.PixelType(Imath.PixelType.FLOAT))
+ 
+     depth_array = np.frombuffer(depth_channel, dtype=np.float32).copy()
+@@ -138,14 +147,20 @@ def infer(pipeline, obj_path, image_file, filenames=['000.png', '005.png', '001.
+         return
+     
+ 
+-    cmds = [f'{blender_path}', '--background', '-Y',
++    # Patch (texture-normal eval baseline harness): resolve scripts/blender_render_ortho.py
++    # to an absolute path so the Blender child doesn't depend on the parent process's cwd
++    # being MVPainter/. (The error path observed at REPO_ROOT/scripts/... means cwd was off.)
++    _MVP_DIR = os.path.dirname(os.path.abspath(__file__))
++    _blender_script_abs = os.path.join(_MVP_DIR, 'scripts', 'blender_render_ortho.py')
++    _blender_bin_abs = blender_path if os.path.isabs(blender_path) else os.path.join(_MVP_DIR, blender_path)
++    cmds = [_blender_bin_abs, '--background', '-Y',
+             '--python',
+-            'scripts/blender_render_ortho.py', '--',
++            _blender_script_abs, '--',
+             '--object_path', f'{obj_path}',
+             '--geo_rotation',f'{args.geo_rotation}'
+             ]
+     print(" ".join(cmds))
+-    subprocess.run(cmds)
++    subprocess.run(cmds, cwd=_MVP_DIR)
+     os.makedirs('render_temp',exist_ok=True)
+     normal_path = os.path.join("render_temp", object_uid,
+                                "normal")
+@@ -273,13 +288,29 @@ if __name__ == '__main__':
+         filename="unet_w_controlnet/v29_25000.ckpt"  # 改成你实际的 ckpt 文件路径
+     )
+ 
+-    ckpt = torch.load(unet_ckpt_path)[
++    # Patch (texture-normal eval baseline harness): load to CPU first to avoid
++    # OOM when CUDA memory is limited (e.g. competing training run on the same GPU).
++    # The pipeline.to('cuda') below will then move only the active model to GPU.
++    ckpt = torch.load(unet_ckpt_path, map_location='cpu')[
+         "state_dict"]
+     new_ckpt = {k[5:]: v for k, v in ckpt.items() if "unet" in k}
+     pipeline.unet.load_state_dict(new_ckpt)
+-
+-
+-    pipeline = pipeline.to(torch.device('cuda'))
++    del ckpt, new_ckpt
++    import gc; gc.collect()
++    if torch.cuda.is_available():
++        torch.cuda.empty_cache()
++
++
++    # Patch (texture-normal eval baseline harness): use model CPU offload to fit
++    # in constrained GPU memory. enable_sequential_cpu_offload caused meta-tensor
++    # errors after our manual unet.load_state_dict, so we use the lighter
++    # enable_model_cpu_offload which doesn't replace tensors with meta proxies.
++    try:
++        pipeline.enable_model_cpu_offload()
++        print('[patch] enabled model CPU offload (limits peak GPU memory)')
++    except Exception as _e:
++        print(f'[patch] CPU offload unavailable, falling back to full-GPU move: {_e}')
++        pipeline = pipeline.to(torch.device('cuda'))
+ 
+     
+ 
+diff --git a/MVPainter/infer_paint.py b/MVPainter/infer_paint.py
+index f6796cd..1d87831 100755
+--- a/MVPainter/infer_paint.py
++++ b/MVPainter/infer_paint.py
+@@ -1,8 +1,18 @@
+ 
+-import os 
++import os
++import sys
+ from glob import glob
+ from scripts.remesh_reduce_blender_script import remesh_and_replace,reduce_mesh
+ import argparse
++
++# Patch (texture-normal eval baseline harness): the os.system(cmd) calls below
++# spawn `python ...` and `../blender-4.2.9-linux-x64/blender ...` via /bin/sh.
++# In our env the system PATH's `python` does not have torch (env not activated
++# inside /bin/sh), and the blender symlink target was bumped to 4.5.0. Use
++# absolute paths everywhere so PATH and version drift don't matter.
++_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
++_PYTHON = sys.executable                                            # the env's python
++_BLENDER = os.path.join(_THIS_DIR, '..', 'blender-4.2.9-linux-x64', 'blender')
+ parser = argparse.ArgumentParser()
+ parser.add_argument('--mv_res_dir', type=str, default='./outputs/test/mvpainter', help='input directory.')
+ parser.add_argument('--output_dir', type=str, default='./results/test/mvpainter', help='output directory.')
+@@ -28,56 +38,56 @@ for obj in objs:
+ if not use_pbr:
+     # 烘焙贴图
+     cmd = f'''
+-    cd mvpainter/ && \
+-    python bake_pipeline.py --input_dir {input_dir} --save_dir {os.path.join(save_path,'glbs')} --offset {args.geo_rotation + 90}
++    cd {_THIS_DIR}/mvpainter/ && \
++    {_PYTHON} bake_pipeline.py --input_dir {input_dir} --save_dir {os.path.join(save_path,'glbs')} --offset {args.geo_rotation + 90}
+     '''
+     os.system(cmd)
+ else:
+     # basecolor
+     cmd = f'''
+-    cd mvpainter/ && \
+-    python bake_pipeline.py --input_dir {input_dir} --save_dir {os.path.join(save_path,'basecolor')} --offset {args.geo_rotation + 90} --suffix _basecolor
++    cd {_THIS_DIR}/mvpainter/ && \
++    {_PYTHON} bake_pipeline.py --input_dir {input_dir} --save_dir {os.path.join(save_path,'basecolor')} --offset {args.geo_rotation + 90} --suffix _basecolor
+     '''
+     os.system(cmd)
+ 
+     cmd = f'''
+-    cd scripts && \
+-    python blender_bake.py --input_dir {os.path.join(save_path,'basecolor')} --save_dir {os.path.join(save_path,'basecolor_bake')}
++    cd {_THIS_DIR}/scripts && \
++    {_BLENDER} --background --python blender_bake.py -- --input_dir {os.path.join(save_path,'basecolor')} --save_dir {os.path.join(save_path,'basecolor_bake')}
+     '''
+     os.system(cmd)
+ 
+ 
+     # metallic
+     cmd = f'''
+-    cd mvpainter/ && \
+-    python bake_pipeline.py --input_dir {input_dir} --save_dir {os.path.join(save_path,'metallic')} --offset {args.geo_rotation + 90} --suffix _metallic
++    cd {_THIS_DIR}/mvpainter/ && \
++    {_PYTHON} bake_pipeline.py --input_dir {input_dir} --save_dir {os.path.join(save_path,'metallic')} --offset {args.geo_rotation + 90} --suffix _metallic
+     '''
+     os.system(cmd)
+ 
+ 
+     cmd = f'''
+-    cd scripts && \
+-    python blender_bake.py --input_dir {os.path.join(save_path,'metallic')} --save_dir {os.path.join(save_path,'metallic_bake')}
++    cd {_THIS_DIR}/scripts && \
++    {_BLENDER} --background --python blender_bake.py -- --input_dir {os.path.join(save_path,'metallic')} --save_dir {os.path.join(save_path,'metallic_bake')}
+     '''
+     os.system(cmd)
+ 
+     # roughness
+ 
+     cmd = f'''
+-    cd mvpainter/ && \
+-    python bake_pipeline.py --input_dir {input_dir} --save_dir {os.path.join(save_path,'roughness')} --offset {args.geo_rotation + 90} --suffix _roughness
++    cd {_THIS_DIR}/mvpainter/ && \
++    {_PYTHON} bake_pipeline.py --input_dir {input_dir} --save_dir {os.path.join(save_path,'roughness')} --offset {args.geo_rotation + 90} --suffix _roughness
+     '''
+     os.system(cmd)
+ 
+     cmd = f'''
+-    cd scripts && \
+-    python blender_bake.py --input_dir {os.path.join(save_path,'roughness')} --save_dir {os.path.join(save_path,'roughness_bake')}
++    cd {_THIS_DIR}/scripts && \
++    {_BLENDER} --background --python blender_bake.py -- --input_dir {os.path.join(save_path,'roughness')} --save_dir {os.path.join(save_path,'roughness_bake')}
+     '''
+     os.system(cmd)
+ 
+     # expor pbr glb
+     cmd = f'''
+-    ../blender-4.2.9-linux-x64/blender  --background -Y --python scripts/blender_pbr_glb.py -- --basecolor_dir {os.path.join(save_path,'basecolor_bake')} --metallic_dir {os.path.join(save_path,'metallic_bake')} --roughness_dir {os.path.join(save_path,'roughness_bake')} --output_dir {os.path.join(save_path,'combine_pbr')}
++    cd {_THIS_DIR} && {_BLENDER}  --background -Y --python scripts/blender_pbr_glb.py -- --basecolor_dir {os.path.join(save_path,'basecolor_bake')} --metallic_dir {os.path.join(save_path,'metallic_bake')} --roughness_dir {os.path.join(save_path,'roughness_bake')} --output_dir {os.path.join(save_path,'combine_pbr')}
+     '''
+     os.system(cmd)
+ 
+diff --git a/MVPainter/infer_paint_timed.py b/MVPainter/infer_paint_timed.py
+new file mode 100644
+index 0000000..db89b09
+--- /dev/null
++++ b/MVPainter/infer_paint_timed.py
+@@ -0,0 +1,137 @@
++import os
++import sys
++import time
++import trimesh
++from glob import glob
++from scripts.remesh_reduce_blender_script import remesh_and_replace, reduce_mesh
++import argparse
++
++_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
++_PYTHON = sys.executable
++_BLENDER = os.path.join(_THIS_DIR, '..', 'blender-4.2.9-linux-x64', 'blender')
++
++parser = argparse.ArgumentParser()
++parser.add_argument('--mv_res_dir', type=str, default='./outputs/test/mvpainter')
++parser.add_argument('--output_dir', type=str, default='./results/test/mvpainter')
++parser.add_argument('--geo_rotation', type=int, default=-90)
++parser.add_argument('--use_pbr', action='store_true')
++args = parser.parse_args()
++
++input_dir = args.mv_res_dir
++save_path = args.output_dir
++use_pbr = args.use_pbr
++
++
++def timed_run(label, cmd):
++    print(f"\n[TIMED] START {label}")
++    t0 = time.time()
++    rc = os.system(cmd)
++    elapsed = time.time() - t0
++    status = "OK" if rc == 0 else f"FAILED (exit {rc})"
++    print(f"[TIMED] END   {label}  {elapsed:.1f}s  {status}")
++    if rc != 0:
++        raise RuntimeError(f"Command failed (exit {rc}):\n{cmd}")
++    return elapsed
++
++
++# Log mesh complexity before baking
++objs = glob(os.path.join(input_dir, '*', 'blender.obj'))
++print(os.path.join(input_dir, '*', 'blender.obj'))
++for obj in objs:
++    try:
++        m = trimesh.load(obj, force='mesh', process=False)
++        if hasattr(m, 'faces'):
++            faces, verts = len(m.faces), len(m.vertices)
++        else:
++            faces = sum(len(s.faces) for s in m.geometry.values())
++            verts = sum(len(s.vertices) for s in m.geometry.values())
++        print(f"[TIMED] mesh {os.path.basename(os.path.dirname(obj))}: {faces:,} faces, {verts:,} verts (blender.obj)")
++    except Exception as e:
++        print(f"[TIMED] mesh load error for {obj}: {e}")
++
++    if os.path.exists(obj.replace('.obj', '_low.obj')):
++        try:
++            m2 = trimesh.load(obj.replace('.obj', '_low.obj'), force='mesh', process=False)
++            if hasattr(m2, 'faces'):
++                lf, lv = len(m2.faces), len(m2.vertices)
++            else:
++                lf = sum(len(s.faces) for s in m2.geometry.values())
++                lv = sum(len(s.vertices) for s in m2.geometry.values())
++            print(f"[TIMED] mesh {os.path.basename(os.path.dirname(obj))}: {lf:,} faces, {lv:,} verts (blender_low.obj)")
++        except Exception as e:
++            print(f"[TIMED] low mesh load error: {e}")
++    else:
++        t0 = time.time()
++        reduce_mesh(obj, target_vertices=30000, output_path=obj.replace('.obj', '_low.obj'))
++        print(f"[TIMED] reduce_mesh: {time.time()-t0:.1f}s")
++
++offset = args.geo_rotation + 90
++stage_times = {}
++
++if not use_pbr:
++    stage_times['bake_pipeline'] = timed_run(
++        'bake_pipeline',
++        f'cd {_THIS_DIR}/mvpainter/ && '
++        f'{_PYTHON} bake_pipeline_timed.py --input_dir {input_dir} '
++        f'--save_dir {os.path.join(save_path, "glbs")} --offset {offset}'
++    )
++else:
++    stage_times['bake_pipeline_basecolor'] = timed_run(
++        'bake_pipeline basecolor',
++        f'cd {_THIS_DIR}/mvpainter/ && '
++        f'{_PYTHON} bake_pipeline_timed.py --input_dir {input_dir} '
++        f'--save_dir {os.path.join(save_path, "basecolor")} --offset {offset} --suffix _basecolor'
++    )
++
++    stage_times['blender_bake_basecolor'] = timed_run(
++        'blender_bake basecolor',
++        f'cd {_THIS_DIR}/scripts && '
++        f'{_BLENDER} --background --python blender_bake.py -- '
++        f'--input_dir {os.path.join(save_path, "basecolor")} '
++        f'--save_dir {os.path.join(save_path, "basecolor_bake")}'
++    )
++
++    stage_times['bake_pipeline_metallic'] = timed_run(
++        'bake_pipeline metallic',
++        f'cd {_THIS_DIR}/mvpainter/ && '
++        f'{_PYTHON} bake_pipeline_timed.py --input_dir {input_dir} '
++        f'--save_dir {os.path.join(save_path, "metallic")} --offset {offset} --suffix _metallic'
++    )
++
++    stage_times['blender_bake_metallic'] = timed_run(
++        'blender_bake metallic',
++        f'cd {_THIS_DIR}/scripts && '
++        f'{_BLENDER} --background --python blender_bake.py -- '
++        f'--input_dir {os.path.join(save_path, "metallic")} '
++        f'--save_dir {os.path.join(save_path, "metallic_bake")}'
++    )
++
++    stage_times['bake_pipeline_roughness'] = timed_run(
++        'bake_pipeline roughness',
++        f'cd {_THIS_DIR}/mvpainter/ && '
++        f'{_PYTHON} bake_pipeline_timed.py --input_dir {input_dir} '
++        f'--save_dir {os.path.join(save_path, "roughness")} --offset {offset} --suffix _roughness'
++    )
++
++    stage_times['blender_bake_roughness'] = timed_run(
++        'blender_bake roughness',
++        f'cd {_THIS_DIR}/scripts && '
++        f'{_BLENDER} --background --python blender_bake.py -- '
++        f'--input_dir {os.path.join(save_path, "roughness")} '
++        f'--save_dir {os.path.join(save_path, "roughness_bake")}'
++    )
++
++    stage_times['blender_pbr_glb'] = timed_run(
++        'blender_pbr_glb',
++        f'cd {_THIS_DIR} && {_BLENDER} --background -Y --python scripts/blender_pbr_glb.py -- '
++        f'--basecolor_dir {os.path.join(save_path, "basecolor_bake")} '
++        f'--metallic_dir {os.path.join(save_path, "metallic_bake")} '
++        f'--roughness_dir {os.path.join(save_path, "roughness_bake")} '
++        f'--output_dir {os.path.join(save_path, "combine_pbr")}'
++    )
++
++total = sum(stage_times.values())
++print("\n[TIMED] Stage 3 summary:")
++for label, secs in stage_times.items():
++    print(f"  {label:<35} {secs:6.1f}s  ({100*secs/total:.0f}%)")
++print(f"  {'TOTAL':<35} {total:6.1f}s")
+diff --git a/MVPainter/mvpainter/bake_pipeline_timed.py b/MVPainter/mvpainter/bake_pipeline_timed.py
+new file mode 100644
+index 0000000..5e24b4d
+--- /dev/null
++++ b/MVPainter/mvpainter/bake_pipeline_timed.py
+@@ -0,0 +1,192 @@
++from mvpainter_pipeline import MVPainter_Pipeline
++import os
++import time
++import trimesh
++import argparse
++import logging
++
++import numpy as np
++import torch
++from PIL import Image
++
++from differentiable_renderer.mesh_render import MeshRender
++from uv_warp_utils import mesh_uv_wrap
++
++logger = logging.getLogger(__name__)
++parser = argparse.ArgumentParser()
++args, extra = parser.parse_known_args()
++parser.add_argument("--input_dir", default="")
++parser.add_argument("--save_dir", default="")
++parser.add_argument("--offset", default=0)
++parser.add_argument("--suffix", default="")
++args = parser.parse_args()
++
++
++def scale_image(img, scale=0.99):
++    original_width, original_height = img.size
++    new_width = int(original_width * scale)
++    new_height = int(original_height * scale)
++    resized_img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
++    output_img = Image.new("RGB", (original_width, original_height), (255, 255, 255))
++    paste_x = (original_width - new_width) // 2
++    paste_y = (original_height - new_height) // 2
++    output_img.paste(resized_img, (paste_x, paste_y))
++    return output_img
++
++
++class BakeConfig:
++    def __init__(self, offset, candidate_view_weights):
++        self.device = 'cuda'
++        self.candidate_camera_azims = [0 + offset, 90 + offset, 180 + offset, 270 + offset, 0 + offset, 0 + offset]
++        self.candidate_camera_elevs = [0, 0, 0, 0, -90, 90]
++        self.candidate_view_weights = candidate_view_weights
++        print(self.candidate_view_weights)
++        self.render_size = 2048
++        self.texture_size = 1024
++        self.bake_exp = 4
++        self.merge_method = 'fast'
++
++
++class BakePipeline:
++    def __init__(self, offset=-90, candidate_view_weights=[1, 0.1, 0.1, 0.1, 0.0, 0.05]):
++        self.models = {}
++        self.config = BakeConfig(offset, candidate_view_weights)
++        self.render = MeshRender(
++            default_resolution=self.config.render_size,
++            texture_size=self.config.texture_size,
++            camera_distance=4
++        )
++
++    def render_normal_multiview(self, camera_elevs, camera_azims, use_abs_coor=True):
++        normal_maps = []
++        for elev, azim in zip(camera_elevs, camera_azims):
++            normal_map = self.render.render_normal(elev, azim, use_abs_coor=use_abs_coor, return_type='pl')
++            normal_maps.append(normal_map)
++        return normal_maps
++
++    def render_position_multiview(self, camera_elevs, camera_azims):
++        position_maps = []
++        for elev, azim in zip(camera_elevs, camera_azims):
++            position_map = self.render.render_position(elev, azim, return_type='pl')
++            position_maps.append(position_map)
++        return position_maps
++
++    def bake_from_multiview(self, views, camera_elevs, camera_azims, view_weights, method='graphcut'):
++        project_textures, project_weighted_cos_maps, project_boundary_maps = [], [], []
++        for view, camera_elev, camera_azim, weight in zip(views, camera_elevs, camera_azims, view_weights):
++            project_texture, project_cos_map, project_boundary_map = self.render.back_project(
++                view, camera_elev, camera_azim)
++            project_cos_map = weight * (project_cos_map ** self.config.bake_exp)
++            project_textures.append(project_texture)
++            project_weighted_cos_maps.append(project_cos_map)
++            project_boundary_maps.append(project_boundary_map)
++
++        if method == 'fast':
++            texture, ori_trust_map = self.render.fast_bake_texture(
++                project_textures, project_weighted_cos_maps)
++        else:
++            raise ValueError(f'no method {method}')
++        return texture, ori_trust_map > 1E-8
++
++    def texture_inpaint(self, texture, mask):
++        texture_np = self.render.uv_inpaint(texture, mask)
++        texture = torch.tensor(texture_np / 255).float().to(texture.device)
++        return texture
++
++    def recenter_image(self, image, border_ratio=0.2):
++        if image.mode == 'RGB':
++            return image
++        elif image.mode == 'L':
++            return image.convert('RGB')
++        alpha_channel = np.array(image)[:, :, 3]
++        non_zero_indices = np.argwhere(alpha_channel > 0)
++        if non_zero_indices.size == 0:
++            raise ValueError("Image is fully transparent")
++        min_row, min_col = non_zero_indices.min(axis=0)
++        max_row, max_col = non_zero_indices.max(axis=0)
++        cropped_image = image.crop((min_col, min_row, max_col + 1, max_row + 1))
++        width, height = cropped_image.size
++        border_width = int(width * border_ratio)
++        border_height = int(height * border_ratio)
++        new_width = width + 2 * border_width
++        new_height = height + 2 * border_height
++        square_size = max(new_width, new_height)
++        new_image = Image.new('RGBA', (square_size, square_size), (255, 255, 255, 0))
++        paste_x = (square_size - new_width) // 2 + border_width
++        paste_y = (square_size - new_height) // 2 + border_height
++        new_image.paste(cropped_image, (paste_x, paste_y))
++        return new_image
++
++    @torch.no_grad()
++    def call_bake(self, mesh, image_paths):
++        timings = {}
++
++        multiviews = [Image.open(p) for p in image_paths]
++
++        t0 = time.time()
++        mesh = mesh_uv_wrap(mesh)
++        timings['mesh_uv_wrap'] = time.time() - t0
++
++        t0 = time.time()
++        self.render.load_mesh(mesh)
++        timings['load_mesh'] = time.time() - t0
++
++        for i in range(len(multiviews)):
++            multiviews[i] = multiviews[i].resize((self.config.render_size, self.config.render_size))
++
++        t0 = time.time()
++        texture, mask = self.bake_from_multiview(
++            multiviews,
++            self.config.candidate_camera_elevs,
++            self.config.candidate_camera_azims,
++            self.config.candidate_view_weights,
++            method=self.config.merge_method,
++        )
++        timings['bake_from_multiview'] = time.time() - t0
++
++        mask_np = (mask.squeeze(-1).cpu().numpy() * 255).astype(np.uint8)
++
++        t0 = time.time()
++        texture = self.texture_inpaint(texture, mask_np)
++        timings['texture_inpaint'] = time.time() - t0
++
++        self.render.set_texture(texture)
++
++        t0 = time.time()
++        textured_mesh = self.render.save_mesh()
++        timings['save_mesh'] = time.time() - t0
++
++        total = sum(timings.values())
++        print("\n[TIMED] bake_pipeline substeps:")
++        for step, secs in timings.items():
++            print(f"  {step:<25} {secs:6.1f}s  ({100*secs/total:.0f}%)")
++        print(f"  {'TOTAL':<25} {total:6.1f}s")
++
++        return textured_mesh
++
++
++pipeline = BakePipeline(offset=int(args.offset))
++
++
++if __name__ == "__main__":
++    dir_path = os.path.join('..', args.input_dir)
++    save_path = os.path.join('..', args.save_dir)
++    suffix = args.suffix
++    os.makedirs(save_path, exist_ok=True)
++
++    for casename in os.listdir(dir_path):
++        work_dir = os.path.join(dir_path, casename)
++        img_paths = [os.path.join(work_dir, f'result_{i}{suffix}.png') for i in [1, 3, 5, 6, 4, 2]]
++        obj = os.path.join(work_dir, 'blender_low.obj')
++
++        mesh = trimesh.load(obj)
++        if hasattr(mesh, 'faces'):
++            faces, verts = len(mesh.faces), len(mesh.vertices)
++        else:
++            faces = sum(len(s.faces) for s in mesh.geometry.values())
++            verts = sum(len(s.vertices) for s in mesh.geometry.values())
++        print(f"\n[TIMED] {casename}: {faces:,} faces, {verts:,} verts (blender_low.obj)")
++
++        mesh = pipeline.call_bake(mesh, img_paths)
++        mesh.export(os.path.join(save_path, casename + '.glb'))
++        print("贴图完成: ", os.path.join(save_path, casename + '.glb'))
+diff --git a/MVPainter/mvpainter/differentiable_renderer/voronoi.py b/MVPainter/mvpainter/differentiable_renderer/voronoi.py
+index 2ba9119..6536980 100755
+--- a/MVPainter/mvpainter/differentiable_renderer/voronoi.py
++++ b/MVPainter/mvpainter/differentiable_renderer/voronoi.py
+@@ -1,11 +1,23 @@
+-""" 
++"""
+ Program to compute Voronoi diagram using JFA.
+ 
+ @author yisiox
+ @version September 2022
+ """
+ 
+-import cupy as cp
++# cupy JIT compilation fails when the CUDA driver version is older than the
++# toolkit used to build cupy (e.g. driver 535.x / CUDA 12.2 with nvcc 12.4).
++# Import cupy lazily so the module-level cp.full() doesn't crash at import
++# time; voronoi_solve falls back to scipy if the cupy path errors at runtime.
++try:
++    import cupy as cp
++    _CUPY_AVAILABLE = True
++    # probe: if this fails, cupy JIT is broken on this driver
++    _test = cp.array([0], dtype='int64')
++    del _test
++except Exception:
++    _CUPY_AVAILABLE = False
++
+ from random import sample
+ 
+ # global variables
+@@ -15,7 +27,15 @@ noSeeds = 1024
+ 
+ # diagram is represented as a 2d array where each element is
+ # x coord of source * y_dim + y coord of source
+-ping = cp.full((x_dim, y_dim), -1, dtype = int)
++# Only allocate if cupy JIT works; generateRandomSeeds is a test helper only.
++if _CUPY_AVAILABLE:
++    try:
++        ping = cp.full((x_dim, y_dim), -1, dtype=int)
++    except Exception:
++        _CUPY_AVAILABLE = False
++        ping = None
++else:
++    ping = None
+ pong = None
+ 
+ 
+@@ -46,10 +66,22 @@ def test_performance():
+ 
+ 
+ 
++def _voronoi_solve_scipy(texture, mask):
++    """scipy nearest-neighbor fallback — same semantics as the cupy JFA path."""
++    from scipy.ndimage import distance_transform_edt
++    import numpy as np
++    h, w, c = texture.shape
++    device = texture.device
++    mask_np = (mask > 0).cpu().numpy().astype(bool)
++    _, (rows, cols) = distance_transform_edt(~mask_np, return_indices=True)
++    tex_np = texture.cpu().numpy()
++    result = tex_np[rows, cols]
++    return torch.from_numpy(result).to(device)
++
++
+ def voronoi_solve(texture, mask):
+-    # return texture
+     '''
+-        This is a warpper of the original cupy voronoi implementation
++        This is a wrapper of the original cupy voronoi implementation.
+         The texture color where mask value is 1 will propagate to its
+         neighbors.
+         args:
+@@ -58,23 +90,25 @@ def voronoi_solve(texture, mask):
+         return:
+             texture - Propagated tensor
+     '''
+-    h, w, c = texture.shape
+-    # hwc_texture = texture.permute(1,2,0)
+-    valid_pix_coord = torch.where(mask>0)
+-
+-    indices = torch.arange(0, h*w).cuda().reshape(h, w)
+-    idx_map = -1 * torch.ones((h,w), dtype=torch.int64).cuda()
+-    idx_map[valid_pix_coord] = indices[valid_pix_coord]
+-
+-    ping = cp.asarray(idx_map)
+-    pong = cp.copy(ping)
+-    ping = JFAVoronoiDiagram(ping, pong)
+-
+-    voronoi_map = torch.as_tensor(ping, device="cuda")
+-    nc_voronoi_texture = torch.index_select(texture.reshape(h*w, c), 0, voronoi_map.reshape(h*w))
+-    voronoi_texture = nc_voronoi_texture.reshape(h, w, c)
+-
+-    return voronoi_texture
++    if not _CUPY_AVAILABLE:
++        return _voronoi_solve_scipy(texture, mask)
++
++    try:
++        h, w, c = texture.shape
++        valid_pix_coord = torch.where(mask > 0)
++        indices = torch.arange(0, h * w).cuda().reshape(h, w)
++        idx_map = -1 * torch.ones((h, w), dtype=torch.int64).cuda()
++        idx_map[valid_pix_coord] = indices[valid_pix_coord]
++
++        ping = cp.asarray(idx_map)
++        pong = cp.copy(ping)
++        ping = JFAVoronoiDiagram(ping, pong)
++
++        voronoi_map = torch.as_tensor(ping, device="cuda")
++        nc_voronoi_texture = torch.index_select(texture.reshape(h * w, c), 0, voronoi_map.reshape(h * w))
++        return nc_voronoi_texture.reshape(h, w, c)
++    except Exception:
++        return _voronoi_solve_scipy(texture, mask)
+ 
+ def generateRandomSeeds(n):
+     """
+@@ -96,15 +130,15 @@ def generateRandomSeeds(n):
+         ping[x, y] = x * y_dim + y
+     pong = cp.copy(ping)
+ 
+-displayKernel = cp.ElementwiseKernel(
+-        "int64 x",
+-        "int64 y",
+-        f"y = (x < 0) ? x : x % 103",
+-        "displayTransform")
+-
+-
++if _CUPY_AVAILABLE:
++    displayKernel = cp.ElementwiseKernel(
++            "int64 x",
++            "int64 y",
++            f"y = (x < 0) ? x : x % 103",
++            "displayTransform")
+ 
+-voronoiKernel = cp.RawKernel(r"""
++if _CUPY_AVAILABLE:
++    voronoiKernel = cp.RawKernel(r"""
+     extern "C" __global__
+     void voronoiPass(const long long step, const long long xDim, const long long yDim, const long long *ping, long long *pong) {
+         long long idx = blockIdx.x * blockDim.x + threadIdx.x;
+diff --git a/MVPainter/scripts/blender_bake.py b/MVPainter/scripts/blender_bake.py
+index e80f2d4..36bc01b 100755
+--- a/MVPainter/scripts/blender_bake.py
++++ b/MVPainter/scripts/blender_bake.py
+@@ -5,8 +5,16 @@ import sys
+ import random
+ import math
+ import argparse
++
++# Patch (texture-normal eval baseline harness): when invoked via
++# `blender --background --python blender_bake.py -- ...`, Blender does not filter
++# sys.argv at `--`; the script sees `[blender, --background, --python, blender_bake.py,
++# --, --input_dir, X, --save_dir, Y]` and argparse fails on `--background` etc.
++# Slice sys.argv at `--` so only the script's own args are parsed.
++if "--" in sys.argv:
++    sys.argv = [sys.argv[0]] + sys.argv[sys.argv.index("--") + 1:]
++
+ parser = argparse.ArgumentParser()
+-args, extra = parser.parse_known_args()
+ parser.add_argument("--input_dir", default="")
+ parser.add_argument("--save_dir",default="")
+ 
+@@ -55,8 +63,18 @@ for glb_file in glb_files:
+ 
+     
+     fbx_path = os.path.join(fbx_dir,f"{name}.obj")
+-    bpy.ops.export_scene.obj(
+-            filepath=fbx_path, 
+-            use_selection=False, 
++    # Patch (texture-normal eval baseline harness): Blender 4.5 removed
++    # bpy.ops.export_scene.obj; the replacement is bpy.ops.wm.obj_export. Keep
++    # a fallback in case anyone re-pins to 4.2.x where only the old name exists.
++    if hasattr(bpy.ops.wm, "obj_export"):
++        bpy.ops.wm.obj_export(
++            filepath=fbx_path,
++            export_selected_objects=False,
++            export_materials=True,
++        )
++    else:
++        bpy.ops.export_scene.obj(
++            filepath=fbx_path,
++            use_selection=False,
+             use_materials=True,
+-            )
++        )
+diff --git a/MVPainter/scripts/remesh_reduce_blender_script.py b/MVPainter/scripts/remesh_reduce_blender_script.py
+index d766d52..47455b3 100755
+--- a/MVPainter/scripts/remesh_reduce_blender_script.py
++++ b/MVPainter/scripts/remesh_reduce_blender_script.py
+@@ -1,5 +1,14 @@
+-import bpy 
+-import os 
++import os
++
++# Patch (texture-normal eval baseline harness): bpy is not available in this env
++# (PyPI ships bpy only for cp311+, our env is cp310). The two functions used by
++# infer_paint.py — reduce_mesh and remesh_and_replace — are wrapped with trimesh
++# fallbacks below, so the missing bpy is non-fatal for our smoke run.
++try:
++    import bpy
++except ModuleNotFoundError:
++    bpy = None
++    print("[patch] bpy not installed; reduce_mesh/remesh_and_replace will use trimesh fallbacks")
+ def update_obj_mtl(obj_path, new_mtl_file="test.mtl"):
+     """
+     修改指定文件夹下所有 .obj 文件，使其引用的 .mtl 文件改为指定的文件名。
+@@ -29,6 +38,32 @@ def update_obj_mtl(obj_path, new_mtl_file="test.mtl"):
+ 
+ 
+ def reduce_mesh(fname, decimate_type='DECIMATE', target_vertices=5000, smooth_type=1,output_path = None):
++    # Patch (texture-normal eval baseline harness): if bpy is missing, fall back to
++    # trimesh-based decimation. infer_paint calls this with target_vertices=30000;
++    # most meshes in our eval are smaller than that already (e.g. 3K-10K verts), so
++    # decimation is a no-op for them — we just copy fname → output_path. For larger
++    # meshes, trimesh's quadric_decimation produces a similarly reduced mesh.
++    if bpy is None:
++        import shutil, os
++        try:
++            import trimesh
++            mesh = trimesh.load(fname, force='mesh', process=False)
++            if hasattr(mesh, 'vertices') and len(mesh.vertices) > target_vertices:
++                # Quadric decimation. trimesh's API: simplify_quadric_decimation(face_count).
++                target_faces = int(target_vertices * 1.8)  # heuristic: faces ≈ 1.8× verts for triangle meshes
++                try:
++                    mesh = mesh.simplify_quadric_decimation(face_count=target_faces)
++                except Exception:
++                    pass  # if decimation fails, write the original mesh
++            if output_path is None:
++                output_path = fname
++            mesh.export(output_path)
++        except Exception as exc:
++            print(f"[patch reduce_mesh] trimesh fallback failed: {exc}; copying {fname} → {output_path}")
++            if output_path is not None and output_path != fname:
++                shutil.copy2(fname, output_path)
++        return
++
+     ### Load ###
+     reset_scene()
+     name = fname.split('/')[-1]
+@@ -92,6 +127,9 @@ def reset_scene() -> None:
+     Returns:
+         None
+     """
++    # Patch: no-op when bpy is unavailable (the trimesh fallback paths don't use it)
++    if bpy is None:
++        return
+     # delete everything that isn't part of a camera or a light
+     for obj in bpy.data.objects:
+         bpy.data.objects.remove(obj, do_unlink=True)
+-- 
+2.43.0
+

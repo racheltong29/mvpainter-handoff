@@ -1,0 +1,358 @@
+diff --git a/MVPainter/infer_paint.py b/MVPainter/infer_paint.py
+index 1d87831..f338b0a 100755
+--- a/MVPainter/infer_paint.py
++++ b/MVPainter/infer_paint.py
+@@ -2,7 +2,6 @@
+ import os
+ import sys
+ from glob import glob
+-from scripts.remesh_reduce_blender_script import remesh_and_replace,reduce_mesh
+ import argparse
+ 
+ # Patch (texture-normal eval baseline harness): the os.system(cmd) calls below
+@@ -12,7 +11,7 @@ import argparse
+ # absolute paths everywhere so PATH and version drift don't matter.
+ _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+ _PYTHON = sys.executable                                            # the env's python
+-_BLENDER = os.path.join(_THIS_DIR, '..', 'blender-4.2.9-linux-x64', 'blender')
++_BLENDER = os.path.join(_THIS_DIR, 'blender', 'blender')
+ parser = argparse.ArgumentParser()
+ parser.add_argument('--mv_res_dir', type=str, default='./outputs/test/mvpainter', help='input directory.')
+ parser.add_argument('--output_dir', type=str, default='./results/test/mvpainter', help='output directory.')
+@@ -29,10 +28,13 @@ use_pbr = args.use_pbr
+ objs = glob(os.path.join(input_dir,'*','blender.obj'))
+ print(os.path.join(input_dir,'*','blender.obj'))
+ for obj in objs:
+-    # remesh_and_replace(obj,voxel_size=0.003)
+-    if os.path.exists(obj.replace('.obj','_low.obj')):
++    obj = os.path.abspath(obj)
++    low_path = obj.replace('.obj','_low.obj')
++    if os.path.exists(low_path):
+         continue
+-    reduce_mesh(obj,target_vertices=30000,output_path=obj.replace('.obj','_low.obj'))
++    cmd = f'''{_BLENDER} --background --python {_THIS_DIR}/scripts/run_reduce_mesh.py -- \
++        --input_obj {obj} --output_obj {low_path} --target_vertices 30000'''
++    os.system(cmd)
+ 
+ 
+ if not use_pbr:
+diff --git a/MVPainter/infer_paint_parallel.py b/MVPainter/infer_paint_parallel.py
+index 08d4b77..6de86b8 100644
+--- a/MVPainter/infer_paint_parallel.py
++++ b/MVPainter/infer_paint_parallel.py
+@@ -3,7 +3,6 @@ import os
+ import sys
+ import subprocess
+ from glob import glob
+-from scripts.remesh_reduce_blender_script import remesh_and_replace, reduce_mesh
+ import argparse
+ 
+ # Patch (texture-normal eval baseline harness): the os.system(cmd) calls below
+@@ -26,13 +25,20 @@ input_dir = args.mv_res_dir
+ save_path = args.output_dir
+ use_pbr = args.use_pbr
+ 
+-# Mesh decimation — shared across all modalities, must finish before bake starts
++# Mesh decimation — shared across all modalities, must finish before bake starts.
++# Runs via the Blender binary (scripts/run_reduce_mesh.py), not an in-process
++# `import bpy`, since this env has no bpy module — see infer_paint.py's identical
++# decimation step for the same reasoning.
+ objs = glob(os.path.join(input_dir, '*', 'blender.obj'))
+ print(os.path.join(input_dir, '*', 'blender.obj'))
+ for obj in objs:
+-    if os.path.exists(obj.replace('.obj', '_low.obj')):
++    obj = os.path.abspath(obj)
++    low_path = obj.replace('.obj', '_low.obj')
++    if os.path.exists(low_path):
+         continue
+-    reduce_mesh(obj, target_vertices=30000, output_path=obj.replace('.obj', '_low.obj'))
++    cmd = f'''{_BLENDER} --background --python {_THIS_DIR}/scripts/run_reduce_mesh.py -- \
++        --input_obj {obj} --output_obj {low_path} --target_vertices 30000'''
++    os.system(cmd)
+ 
+ 
+ def run(cmd):
+diff --git a/MVPainter/infer_pbr.py b/MVPainter/infer_pbr.py
+index 164032f..9531249 100755
+--- a/MVPainter/infer_pbr.py
++++ b/MVPainter/infer_pbr.py
+@@ -70,17 +70,31 @@ def save_image(out, name):
+     create_image_grid(os.path.join(output_dir, name),suffix='roughness',output_path=os.path.join(output_dir,name,'combine_roughness.png'))
+     create_image_grid(os.path.join(output_dir, name),suffix='metallic',output_path=os.path.join(output_dir,name,'combine_metallic.png'))
+ 
++
++# Patch (texture-normal eval baseline harness): pin exact Hub revisions.
++# Both from_pretrained calls below previously floated on each repo's `main`
++# branch with no `revision=`, so two environments (or the same environment at
++# two different times) can silently resolve to different actual weights
++# despite naming "the same" checkpoint. This showed up as drastically
++# different roughness/metallic predictions for the same asset between a
++# local run and a teammate's run. Pinning to the commit already cached here
++# makes runs reproducible; bump these deliberately (not silently) if the
++# upstream repos are intentionally updated.
++IDARB_REVISION = "1d00fda59fc7a48c11581d112eaef333f06aeef1"
++MVPAINTER_REVISION = "85a9cb12b444a73ba922ac44fd198e8de12f8a9d"
++
++
+ def load_pipeline():
+     """
+     load pipeline from hub
+     or load from local ckpts: pipeline = IDArbDiffusionPipeline.from_pretrained("./pipeckpts")
+     """
+-    text_encoder = CLIPTextModel.from_pretrained("lizb6626/IDArb", subfolder="text_encoder")
+-    tokenizer = CLIPTokenizer.from_pretrained("lizb6626/IDArb", subfolder="tokenizer")
+-    feature_extractor = CLIPImageProcessor.from_pretrained("lizb6626/IDArb", subfolder="feature_extractor")
+-    vae = AutoencoderKL.from_pretrained("lizb6626/IDArb", subfolder="vae")
+-    scheduler = DDIMScheduler.from_pretrained("lizb6626/IDArb", subfolder="scheduler")
+-    unet = UNetDR2DConditionModel.from_pretrained("shaomq/MVPainter", subfolder="unet_pbr")
++    text_encoder = CLIPTextModel.from_pretrained("lizb6626/IDArb", subfolder="text_encoder", revision=IDARB_REVISION)
++    tokenizer = CLIPTokenizer.from_pretrained("lizb6626/IDArb", subfolder="tokenizer", revision=IDARB_REVISION)
++    feature_extractor = CLIPImageProcessor.from_pretrained("lizb6626/IDArb", subfolder="feature_extractor", revision=IDARB_REVISION)
++    vae = AutoencoderKL.from_pretrained("lizb6626/IDArb", subfolder="vae", revision=IDARB_REVISION)
++    scheduler = DDIMScheduler.from_pretrained("lizb6626/IDArb", subfolder="scheduler", revision=IDARB_REVISION)
++    unet = UNetDR2DConditionModel.from_pretrained("shaomq/MVPainter", subfolder="unet_pbr", revision=MVPAINTER_REVISION)
+     
+     pipeline = IDArbDiffusionPipeline(
+         text_encoder=text_encoder,
+@@ -96,8 +110,23 @@ def load_pipeline():
+ 
+ parser = argparse.ArgumentParser()
+ parser.add_argument('--mv_res_dir', type=str, default='example/single', help='Input data directory')
++parser.add_argument('--seed', type=int, default=12, help='Random seed for sampling (matches infer_multiview.py default).')
++parser.add_argument('--guidance_scale', type=float, default=1.0, help='Classifier-free guidance scale. NOTE: the pipeline only enables CFG when this != 1.0 (see do_classifier_free_guidance in pipeline_idarbdiffusion.py); the pipeline'"'"'s own default is 7.5. Kept at 1.0 here to preserve prior behavior unless explicitly overridden.')
++parser.add_argument('--eta', type=float, default=1.0, help='DDIM eta. 1.0 = full stochastic noise injection at every step (DDPM-like); 0.0 = fully deterministic ODE trajectory. Kept at 1.0 here to preserve prior behavior unless explicitly overridden.')
+ args = parser.parse_args()
+ 
++# Patch (texture-normal eval baseline harness): this stage previously sampled
++# with no fixed seed at all -- the `generator=generator` kwarg below was
++# commented out and `generator` was never even defined, so the initial noise
++# (and the whole diffusion trajectory) came from whatever the ambient,
++# unseeded PyTorch RNG state happened to be. That alone reproduces the
++# run-to-run drift we saw in the metallic/roughness channel (a weakly
++# conditioned, near-flat "single global guess" per asset is exactly the kind
++# of output that a different starting noise can shift substantially, even
++# though it barely affects the strongly-grounded albedo channel). Seeding
++# here, the same way infer_multiview.py already does, is required for
++# reproducible roughness/metallic output given a fixed checkpoint.
++generator = torch.Generator(device="cuda").manual_seed(args.seed)
+ 
+ weight_dtype = torch.float16
+ 
+@@ -146,11 +175,11 @@ for i, batch in enumerate(dataloader):
+                 num_views=Nv,
+                 cam_pose=cam_pose,
+                 height=H, width=W,
+-                # generator=generator,
+-                guidance_scale=1.0,
++                generator=generator,
++                guidance_scale=args.guidance_scale,
+                 output_type='pt',
+                 num_images_per_prompt=1,
+-                eta=1.0,
++                eta=args.eta,
+             ).images
+ 
+         out = out.view(B, Nv, Nd, *out.shape[1:])
+diff --git a/MVPainter/scripts/remesh_reduce_blender_script.py b/MVPainter/scripts/remesh_reduce_blender_script.py
+index 47455b3..f175155 100755
+--- a/MVPainter/scripts/remesh_reduce_blender_script.py
++++ b/MVPainter/scripts/remesh_reduce_blender_script.py
+@@ -1,18 +1,15 @@
+ import os
+ 
+-# Patch (texture-normal eval baseline harness): bpy is not available in this env
+-# (PyPI ships bpy only for cp311+, our env is cp310). The two functions used by
+-# infer_paint.py — reduce_mesh and remesh_and_replace — are wrapped with trimesh
+-# fallbacks below, so the missing bpy is non-fatal for our smoke run.
+ try:
+     import bpy
+ except ModuleNotFoundError:
+     bpy = None
+-    print("[patch] bpy not installed; reduce_mesh/remesh_and_replace will use trimesh fallbacks")
++
++
+ def update_obj_mtl(obj_path, new_mtl_file="test.mtl"):
+     """
+     修改指定文件夹下所有 .obj 文件，使其引用的 .mtl 文件改为指定的文件名。
+-    
++
+     :param folder_path: 文件夹路径
+     :param new_mtl_file: 新的 .mtl 文件名（默认 'test.mtl'）
+     """
+@@ -37,43 +34,21 @@ def update_obj_mtl(obj_path, new_mtl_file="test.mtl"):
+         print(f"处理 {obj_path} 时发生错误: {e}")
+ 
+ 
+-def reduce_mesh(fname, decimate_type='DECIMATE', target_vertices=5000, smooth_type=1,output_path = None):
+-    # Patch (texture-normal eval baseline harness): if bpy is missing, fall back to
+-    # trimesh-based decimation. infer_paint calls this with target_vertices=30000;
+-    # most meshes in our eval are smaller than that already (e.g. 3K-10K verts), so
+-    # decimation is a no-op for them — we just copy fname → output_path. For larger
+-    # meshes, trimesh's quadric_decimation produces a similarly reduced mesh.
+-    if bpy is None:
+-        import shutil, os
+-        try:
+-            import trimesh
+-            mesh = trimesh.load(fname, force='mesh', process=False)
+-            if hasattr(mesh, 'vertices') and len(mesh.vertices) > target_vertices:
+-                # Quadric decimation. trimesh's API: simplify_quadric_decimation(face_count).
+-                target_faces = int(target_vertices * 1.8)  # heuristic: faces ≈ 1.8× verts for triangle meshes
+-                try:
+-                    mesh = mesh.simplify_quadric_decimation(face_count=target_faces)
+-                except Exception:
+-                    pass  # if decimation fails, write the original mesh
+-            if output_path is None:
+-                output_path = fname
+-            mesh.export(output_path)
+-        except Exception as exc:
+-            print(f"[patch reduce_mesh] trimesh fallback failed: {exc}; copying {fname} → {output_path}")
+-            if output_path is not None and output_path != fname:
+-                shutil.copy2(fname, output_path)
+-        return
++def reduce_mesh(fname, decimate_type='DECIMATE', target_vertices=5000, smooth_type=1, output_path=None):
++    # Precondition: this function only works when run inside the Blender binary
++    # (see scripts/blender_reduce_mesh.py). Fail loudly instead of silently
++    # no-op'ing if bpy didn't load.
++    assert bpy is not None, "bpy not available - reduce_mesh must be run via the Blender binary (see blender_reduce_mesh.py)"
+ 
+     ### Load ###
+     reset_scene()
+     name = fname.split('/')[-1]
+     input_obj_path = fname #tmppath or fname
+     if fname.endswith('.obj'):
+-        bpy.ops.import_scene.obj(filepath=input_obj_path)
++        bpy.ops.wm.obj_import(filepath=input_obj_path)
+     elif fname.endswith('.glb'):
+         bpy.ops.import_scene.gltf(filepath=input_obj_path)
+ 
+-
+     ### Decimate ###
+     for obj in bpy.context.scene.objects:
+             # ratio = target_vertices / current_poly_count
+@@ -85,8 +60,14 @@ def reduce_mesh(fname, decimate_type='DECIMATE', target_vertices=5000, smooth_ty
+                 bpy.ops.object.mode_set(mode='EDIT')  # 进入编辑模式
+                 # 合并多余顶点（按距离合并）
+                 bpy.ops.mesh.remove_doubles(threshold=0.0001)  # 可修改 threshold 来调整合并距离
++                bpy.ops.object.mode_set(mode='OBJECT')
+ 
+                 current_poly_count = len(obj.data.vertices)  # 获取当前顶点数
++                print(f"[reduce_mesh] {name}/{obj.name}: after remove_doubles -> "
++                      f"verts={current_poly_count} faces={len(obj.data.polygons)} "
++                      f"(target_vertices={target_vertices})")
++
++                n_iter = 0
+                 while current_poly_count > target_vertices:
+ 
+                     bpy.context.view_layer.objects.active = obj
+@@ -97,16 +78,41 @@ def reduce_mesh(fname, decimate_type='DECIMATE', target_vertices=5000, smooth_ty
+                     bpy.context.view_layer.update()
+                     bpy.ops.object.mode_set(mode='OBJECT')
+                     bpy.ops.object.modifier_apply(modifier=decimate_type)
+-                    current_poly_count = len(obj.data.vertices)  # 获取当前顶点数
+-                    print("当前顶点数:",current_poly_count)
+-
++                    new_poly_count = len(obj.data.vertices)  # 获取当前顶点数
++                    n_iter += 1
++                    print(f"[reduce_mesh] {name}/{obj.name}: decimate iter {n_iter} -> "
++                          f"verts={new_poly_count} faces={len(obj.data.polygons)}")
++
++                    # Some topologies (e.g. thin disconnected hair strands) hit a
++                    # structural floor where DECIMATE can't reduce further even
++                    # though we're still above target_vertices - without this,
++                    # the loop spins forever reapplying a no-op modifier.
++                    if new_poly_count >= current_poly_count:
++                        print(f"[reduce_mesh] {name}/{obj.name}: decimate stalled "
++                              f"(no progress past {new_poly_count} verts, target was "
++                              f"{target_vertices}) - stopping early")
++                        current_poly_count = new_poly_count
++                        break
++                    current_poly_count = new_poly_count
++
++                print(f"[reduce_mesh] {name}/{obj.name}: post-decimate final -> "
++                      f"verts={current_poly_count} faces={len(obj.data.polygons)}")
++
++    # Debug: dump the decimated-but-unsmoothed mesh so it's possible to tell whether
++    # fragmentation comes from the DECIMATE modifier itself or from the smoothing step
++    # below.
++    if output_path is not None:
++        root, ext = os.path.splitext(output_path)
++        debug_path = f"{root}_postdecimate_debug{ext}"
++        bpy.ops.wm.obj_export(filepath=debug_path, export_selected_objects=False)
++        print(f"[reduce_mesh] {name}: wrote post-decimate debug snapshot -> {debug_path}")
+ 
+     # Smooth #
+     bpy.ops.object.mode_set(mode='OBJECT')
+     for obj in bpy.context.scene.objects:
+         if obj.type == 'MESH':
+             bpy.context.view_layer.objects.active = obj
+-            
++
+             if smooth_type==1:
+                 bpy.ops.object.shade_smooth()
+             elif smooth_type==2:
+@@ -115,9 +121,10 @@ def reduce_mesh(fname, decimate_type='DECIMATE', target_vertices=5000, smooth_ty
+                 obj.data.auto_smooth_angle = 30.0 * 3.14159 / 180.0
+             else:
+                 bpy.ops.object.shade_flat()
+-            
++
+     # Export obj #
+-    bpy.ops.export_scene.obj(filepath=output_path, use_selection=False)
++    bpy.ops.wm.obj_export(filepath=output_path, export_selected_objects=False)
++    print(f"[reduce_mesh] {name}: exported decimated+smoothed mesh -> {output_path}")
+ 
+ 
+ 
+@@ -127,7 +134,6 @@ def reset_scene() -> None:
+     Returns:
+         None
+     """
+-    # Patch: no-op when bpy is unavailable (the trimesh fallback paths don't use it)
+     if bpy is None:
+         return
+     # delete everything that isn't part of a camera or a light
+@@ -145,13 +151,13 @@ def reset_scene() -> None:
+     # delete all the images
+     for image in bpy.data.images:
+         bpy.data.images.remove(image, do_unlink=True)
+-    
++
+ def remesh_and_replace(fname, voxel_size=0.0005,output_path = None):
+     ### Load ###
+     reset_scene()
+     name = fname.split('/')[-1]
+     input_obj_path = fname #tmppath or fname
+-    bpy.ops.import_scene.obj(filepath=input_obj_path)
++    bpy.ops.wm.obj_import(filepath=input_obj_path)
+     model_name = os.path.splitext(os.path.basename(input_obj_path))[0]
+     for obj in bpy.context.scene.objects:
+         if obj.type =='MESH':
+@@ -162,10 +168,10 @@ def remesh_and_replace(fname, voxel_size=0.0005,output_path = None):
+             bpy.ops.object.mode_set(mode='EDIT')  # 进入编辑模式
+             # 合并多余顶点（按距离合并）
+             bpy.ops.mesh.remove_doubles(threshold=0.0001)  # 可修改 threshold 来调整合并距离
+-            
++
+             print("before remesh vertices:",len(obj.data.vertices))
+ 
+-            
++
+             bpy.ops.object.mode_set(mode='OBJECT')  # 进入编辑模式
+ 
+ 
+@@ -175,12 +181,10 @@ def remesh_and_replace(fname, voxel_size=0.0005,output_path = None):
+             remesh_modifier.mode = 'VOXEL'
+             remesh_modifier.voxel_size = voxel_size
+             bpy.ops.object.modifier_apply(modifier="Remesh")
+-    
++
+ 
+     if output_path is None:
+ 
+-        bpy.ops.export_scene.obj(filepath=fname.replace('.obj','_new.obj'), use_selection=False)
++        bpy.ops.wm.obj_export(filepath=fname.replace('.obj','_new.obj'), export_selected_objects=False)
+     else:
+-        bpy.ops.export_scene.obj(filepath=(output_path), use_selection=False)
+-
+-
++        bpy.ops.wm.obj_export(filepath=(output_path), export_selected_objects=False)

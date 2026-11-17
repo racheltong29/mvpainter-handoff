@@ -1,0 +1,119 @@
+From fddbd9b2f21de23680a5edc9c4bf71d09547ddee Mon Sep 17 00:00:00 2001
+From: racheltong29 <racheltong29@gmail.com>
+Date: Mon, 8 Jun 2026 18:15:35 +0000
+Subject: [PATCH 1/2] Add infer_paint_parallel.py: run 3 PBR bake modalities in
+ parallel
+
+Replaces sequential os.system calls in infer_paint.py with subprocess.Popen
+so basecolor/metallic/roughness bake_pipeline + blender_bake pairs run
+concurrently. ~3x wall-clock speedup on heavy meshes (tested on 1.55M-face
+and 497k-face assets). Original infer_paint.py is untouched.
+
+Co-Authored-By: Claude Sonnet 4.6 <noreply@anthropic.com>
+---
+ MVPainter/infer_paint_parallel.py | 93 +++++++++++++++++++++++++++++++
+ 1 file changed, 93 insertions(+)
+ create mode 100644 MVPainter/infer_paint_parallel.py
+
+diff --git a/MVPainter/infer_paint_parallel.py b/MVPainter/infer_paint_parallel.py
+new file mode 100644
+index 0000000..08d4b77
+--- /dev/null
++++ b/MVPainter/infer_paint_parallel.py
+@@ -0,0 +1,93 @@
++
++import os
++import sys
++import subprocess
++from glob import glob
++from scripts.remesh_reduce_blender_script import remesh_and_replace, reduce_mesh
++import argparse
++
++# Patch (texture-normal eval baseline harness): the os.system(cmd) calls below
++# spawn `python ...` and `../blender-4.2.9-linux-x64/blender ...` via /bin/sh.
++# In our env the system PATH's `python` does not have torch (env not activated
++# inside /bin/sh), and the blender symlink target was bumped to 4.5.0. Use
++# absolute paths everywhere so PATH and version drift don't matter.
++_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
++_PYTHON = sys.executable                                            # the env's python
++_BLENDER = os.path.join(_THIS_DIR, '..', 'blender-4.2.9-linux-x64', 'blender')
++
++parser = argparse.ArgumentParser()
++parser.add_argument('--mv_res_dir', type=str, default='./outputs/test/mvpainter', help='input directory.')
++parser.add_argument('--output_dir', type=str, default='./results/test/mvpainter', help='output directory.')
++parser.add_argument('--geo_rotation', type=int, default=-90)
++parser.add_argument('--use_pbr', action='store_true', help='Enable PBR painting')
++
++args = parser.parse_args()
++input_dir = args.mv_res_dir
++save_path = args.output_dir
++use_pbr = args.use_pbr
++
++# Mesh decimation — shared across all modalities, must finish before bake starts
++objs = glob(os.path.join(input_dir, '*', 'blender.obj'))
++print(os.path.join(input_dir, '*', 'blender.obj'))
++for obj in objs:
++    if os.path.exists(obj.replace('.obj', '_low.obj')):
++        continue
++    reduce_mesh(obj, target_vertices=30000, output_path=obj.replace('.obj', '_low.obj'))
++
++
++def run(cmd):
++    """Run a shell command, raise on non-zero exit."""
++    rc = os.system(cmd)
++    if rc != 0:
++        raise RuntimeError(f'Command failed (exit {rc}):\n{cmd}')
++
++
++def popen(cmd):
++    return subprocess.Popen(cmd, shell=True)
++
++
++def wait_all(procs):
++    """Wait for all (label, Popen) pairs; raise if any fails."""
++    for label, p in procs:
++        rc = p.wait()
++        if rc != 0:
++            raise RuntimeError(f'Subprocess failed for {label} (exit {rc})')
++
++
++if not use_pbr:
++    run(f'cd {_THIS_DIR}/mvpainter/ && '
++        f'{_PYTHON} bake_pipeline.py --input_dir {input_dir} '
++        f'--save_dir {os.path.join(save_path, "glbs")} --offset {args.geo_rotation + 90}')
++else:
++    offset = args.geo_rotation + 90
++    modalities = ['basecolor', 'metallic', 'roughness']
++
++    # Launch all 3 bake_pipeline.py calls in parallel (independent modalities)
++    bake_procs = [
++        (mod, popen(
++            f'cd {_THIS_DIR}/mvpainter/ && '
++            f'{_PYTHON} bake_pipeline.py --input_dir {input_dir} '
++            f'--save_dir {os.path.join(save_path, mod)} --offset {offset} --suffix _{mod}'
++        ))
++        for mod in modalities
++    ]
++    wait_all(bake_procs)
++
++    # Launch all 3 blender_bake.py calls in parallel
++    blender_procs = [
++        (mod, popen(
++            f'cd {_THIS_DIR}/scripts && '
++            f'{_BLENDER} --background --python blender_bake.py -- '
++            f'--input_dir {os.path.join(save_path, mod)} '
++            f'--save_dir {os.path.join(save_path, mod + "_bake")}'
++        ))
++        for mod in modalities
++    ]
++    wait_all(blender_procs)
++
++    # Combine into final PBR GLB — must run after all modalities are baked
++    run(f'cd {_THIS_DIR} && {_BLENDER} --background -Y --python scripts/blender_pbr_glb.py -- '
++        f'--basecolor_dir {os.path.join(save_path, "basecolor_bake")} '
++        f'--metallic_dir {os.path.join(save_path, "metallic_bake")} '
++        f'--roughness_dir {os.path.join(save_path, "roughness_bake")} '
++        f'--output_dir {os.path.join(save_path, "combine_pbr")}')
+-- 
+2.43.0
+
